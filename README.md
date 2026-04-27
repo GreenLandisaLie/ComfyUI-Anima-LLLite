@@ -3,13 +3,14 @@
 ComfyUI custom node for **ControlNet-LLLite for Anima** (DiT-based).
 
 LLLite is a lightweight ControlNet variant that injects a low-rank correction
-into the attention projections of the DiT. This node loads weights trained with
+into the attention (and optionally MLP) projections of the DiT. This node
+loads weights trained with
 [kohya-ss/sd-scripts](https://github.com/kohya-ss/sd-scripts) and applies them
 to the ComfyUI Anima model at inference time.
 
 This is intended as a **minimal reference implementation**. Community nodes
-with extra features (per-step scheduling, multi-cond, region masks, …) are
-welcome and can build on this codebase.
+with extra features (per-step scheduling, multi-cond, region masks, per-block
+selection, …) are welcome and can build on this codebase.
 
 ## Install
 
@@ -32,35 +33,65 @@ Place LLLite weights (`.safetensors`) under `ComfyUI/models/controlnet/`.
 | `lllite_name` | filename | from `models/controlnet/` |
 | `image` | IMAGE | control image (any resolution; auto-resized to latent×8) |
 | `strength` | FLOAT | LLLite multiplier (default 1.0) |
-| `cond_emb_dim` / `mlp_dim` / `target_layers` | optional | overrides for weights without metadata |
 
 Output: patched `MODEL`.
 
+All architectural parameters (`cond_emb_dim`, `mlp_dim`, `cond_dim`,
+`cond_resblocks`, `use_aspp`, `aspp_dilations`, `target_layers`) are baked
+into the trained weights and read automatically from the safetensors
+metadata — they are not exposed as node inputs because changing them would
+just cause load errors.
+
 ## How it works
 
-* Discovers `q_proj` / `k_proj` / `v_proj` Linears under each Attention block of
-  the Anima DiT (skipping the LLM-Adapter and `output_proj`).
-* On each sampling step the wrapper monkey-patches those Linears with the LLLite
-  forward, runs `apply_model`, and restores the originals — so the patch never
-  leaks across model clones.
+* Discovers the LLLite target Linears under each Anima DiT block according to
+  the `target_atomics` recorded in the weight metadata:
+  * `self_attn_q_pre` → self-attention `q_proj`
+  * `self_attn_kv_pre` → self-attention `k_proj` + `v_proj`
+  * `cross_attn_q_pre` → cross-attention `q_proj`
+  * `mlp_fc1_pre` → `GPT2FeedForward.layer1` (the MLP fc1)
+
+  The LLM-Adapter sub-tree and `output_proj` are always skipped.
+* On each sampling step the wrapper monkey-patches those Linears with the
+  LLLite forward, runs `apply_model`, and restores the originals — so the
+  patch never leaks across model clones.
 * The control image is resized to `latent_HW * 8` once per resolution, then
-  embedded by `conditioning1` (stride-16 Conv stack) to a per-token feature map
-  matching the DiT token grid.
+  embedded by the v2 `conditioning1` trunk (Conv 4×4 s=4 → Conv 3×3 s=1 →
+  Conv 4×4 s=4 with GroupNorm/SiLU, optional ResBlocks, optional ASPP, 1×1
+  projection, LayerNorm) to a per-token feature map matching the DiT token
+  grid.
+* Each LLLite module applies the v2 forward: `down → silu → concat with
+  (cond + per-module depth-embedding) → mid → FiLM(γ, β) → silu → up`,
+  added to the original Linear input.
 * CFG is supported: `cond_emb` is broadcast to match the runtime batch size.
 
-## Weight format
+## Weight format (v2, named keys)
 
-State dict keys are the same as sd-scripts:
+The state dict is in the v2 self-describing format. Each LLLite module's
+weights are prefixed by the target Linear's full path, so the file alone
+identifies which Linear each tensor belongs to:
+
 ```
-conditioning1.{0,2}.{weight,bias}
-lllite_modules.{i}.down.0.{weight,bias}
-lllite_modules.{i}.mid.0.{weight,bias}
-lllite_modules.{i}.up.{weight,bias}
+lllite_conditioning1.{conv1,conv2,conv3,norm1,...,proj,out_norm,...}.{weight,bias}
+lllite_dit_blocks_{i}_self_attn_q_proj.down.{weight,bias}
+lllite_dit_blocks_{i}_self_attn_q_proj.mid.{weight,bias}
+lllite_dit_blocks_{i}_self_attn_q_proj.cond_to_film.{weight,bias}
+lllite_dit_blocks_{i}_self_attn_q_proj.up.{weight,bias}
+lllite_dit_blocks_{i}_self_attn_q_proj.depth_embed
+...
 ```
 
-If the safetensors file has metadata (`lllite.cond_emb_dim`, `lllite.mlp_dim`,
-`lllite.target_layers`), the node reads it automatically; otherwise specify the
-values via the optional inputs.
+The expected safetensors metadata keys are:
+
+* `lllite.version` (= `"2"`)
+* `lllite.cond_emb_dim`, `lllite.mlp_dim`
+* `lllite.cond_dim`, `lllite.cond_resblocks`
+* `lllite.use_aspp`, `lllite.aspp_dilations`
+* `lllite.target_atomics` (canonical, comma-separated atomic specifiers) —
+  falls back to `lllite.target_layers` for older v2 snapshots
+
+**Legacy weights with `lllite_modules.{i}.*` keys (the pre-v2 format) are
+rejected on load.** Re-train against the current sd-scripts codebase.
 
 ## Credits
 

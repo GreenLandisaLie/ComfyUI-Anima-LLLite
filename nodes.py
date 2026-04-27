@@ -18,6 +18,7 @@ import torch.nn.functional as F
 import folder_paths
 
 from .control_net_lllite_anima import (
+    ASPP_DEFAULT_DILATIONS,
     ControlNetLLLiteDiT,
     load_lllite_weights,
     read_lllite_metadata,
@@ -71,30 +72,33 @@ class AnimaLLLiteApply:
                 "image": ("IMAGE",),
                 "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
             },
-            "optional": {
-                "cond_emb_dim": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1,
-                                          "tooltip": "0 = read from weights metadata (default 32)"}),
-                "mlp_dim": ("INT", {"default": 0, "min": 0, "max": 1024, "step": 1,
-                                     "tooltip": "0 = read from weights metadata (default 64)"}),
-                "target_layers": (["auto", "self_attn_q", "self_attn_qkv", "self_attn_qkv_cross_q"],
-                                  {"default": "auto"}),
-            },
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply"
     CATEGORY = "loaders"
 
-    def apply(self, model, lllite_name, image, strength,
-              cond_emb_dim=0, mlp_dim=0, target_layers="auto"):
+    def apply(self, model, lllite_name, image, strength):
         weights_path = folder_paths.get_full_path("controlnet", lllite_name)
         if weights_path is None or not os.path.isfile(weights_path):
             raise FileNotFoundError(f"LLLite weights not found: {lllite_name}")
 
+        # Architecture is fully determined by the trained weights — read everything
+        # from metadata rather than exposing knobs that would just cause load errors.
         meta = read_lllite_metadata(weights_path)
-        ce_dim = cond_emb_dim if cond_emb_dim > 0 else int(meta.get("lllite.cond_emb_dim", 32))
-        m_dim = mlp_dim if mlp_dim > 0 else int(meta.get("lllite.mlp_dim", 64))
-        tl = target_layers if target_layers != "auto" else meta.get("lllite.target_layers", "self_attn_q")
+        ce_dim = int(meta.get("lllite.cond_emb_dim", 32))
+        m_dim = int(meta.get("lllite.mlp_dim", 64))
+        # v2 records the canonical atomic form under lllite.target_atomics; fall back
+        # to the legacy preset key, then to the v1 default.
+        tl = meta.get("lllite.target_atomics", meta.get("lllite.target_layers", "self_attn_q"))
+        cond_dim = int(meta.get("lllite.cond_dim", 64))
+        cond_resblocks = int(meta.get("lllite.cond_resblocks", 1))
+        use_aspp = str(meta.get("lllite.use_aspp", "false")).lower() == "true"
+        aspp_dilations_meta = meta.get("lllite.aspp_dilations")
+        if use_aspp and aspp_dilations_meta:
+            aspp_dilations = tuple(int(d) for d in aspp_dilations_meta.split(",") if d.strip())
+        else:
+            aspp_dilations = ASPP_DEFAULT_DILATIONS
 
         dit = _get_inner_dit(model)
         lllite = ControlNetLLLiteDiT(
@@ -103,6 +107,10 @@ class AnimaLLLiteApply:
             mlp_dim=m_dim,
             target_layers=tl,
             multiplier=strength,
+            cond_dim=cond_dim,
+            cond_resblocks=cond_resblocks,
+            use_aspp=use_aspp,
+            aspp_dilations=aspp_dilations,
         )
         load_lllite_weights(lllite, weights_path, strict=False)
         lllite.eval().requires_grad_(False)
