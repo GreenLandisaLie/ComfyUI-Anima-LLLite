@@ -5,6 +5,14 @@ and a strength; returns the patched MODEL. Integration is done via
 ``set_model_unet_function_wrapper`` so the LLLite contribution is fully scoped
 to this model clone — no global monkey-patching that could leak into other
 samplers in the same workflow.
+
+Because ``model_function_wrapper`` is a single-slot field on ``model_options``,
+cascading two wrapper-installing nodes would normally cause the outer one to
+silently overwrite the inner one. The node captures any pre-existing wrapper
+before cloning and delegates to it from inside its own wrapper, so multiple
+Anima-LLLite nodes (and other well-behaved wrapper nodes) can be stacked. The
+``preserve_wrapper`` toggle (default on) controls this delegation, mirroring
+``ChromaRadianceOptions``.
 """
 from __future__ import annotations
 
@@ -122,6 +130,7 @@ class AnimaLLLiteApply:
                 "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "preserve_wrapper": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 # Required when the loaded weights are 4ch (inpaint). White = inpaint area,
@@ -134,7 +143,8 @@ class AnimaLLLiteApply:
     FUNCTION = "apply"
     CATEGORY = "loaders"
 
-    def apply(self, model, lllite_name, image, strength, start_percent, end_percent, mask=None):
+    def apply(self, model, lllite_name, image, strength, start_percent, end_percent,
+              preserve_wrapper=True, mask=None):
         weights_path = folder_paths.get_full_path("controlnet", lllite_name)
         if weights_path is None or not os.path.isfile(weights_path):
             raise FileNotFoundError(f"LLLite weights not found: {lllite_name}")
@@ -203,6 +213,17 @@ class AnimaLLLiteApply:
         # Cache for the per-resolution preprocessed cond image (avoids repeat resize)
         cache = {"cond_image_pp": None, "key": None, "lllite_loaded_to": None}
 
+        # Capture any previously-installed wrapper BEFORE we clone — model_options
+        # has a single "model_function_wrapper" slot, so without delegation a second
+        # wrapper-installing node would silently no-op the first. Mirrors the
+        # ChromaRadianceOptions pattern in comfy_extras/nodes_chroma_radiance.py.
+        old_wrapper = model.model_options.get("model_function_wrapper")
+
+        def _call_next(apply_model, input_x, timestep, c):
+            if preserve_wrapper and old_wrapper is not None:
+                return old_wrapper(apply_model, {"input": input_x, "timestep": timestep, "c": c})
+            return apply_model(input_x, timestep, **c)
+
         def wrapper(apply_model, args):
             input_x = args["input"]
             timestep = args["timestep"]
@@ -213,7 +234,7 @@ class AnimaLLLiteApply:
             # 1.0 → sigma_min, so the active window is sigma_end <= sigma <= sigma_start.
             sigma = float(timestep.max().item())
             if not (sigma_end <= sigma <= sigma_start):
-                return apply_model(input_x, timestep, **c)
+                return _call_next(apply_model, input_x, timestep, c)
 
             # Anima latent shape: (B, C, T, H, W) — take spatial dims from the tail.
             latent_h, latent_w = int(input_x.shape[-2]), int(input_x.shape[-1])
@@ -247,7 +268,7 @@ class AnimaLLLiteApply:
             lllite.set_cond_image(cache["cond_image_pp"])
             lllite.apply_to()
             try:
-                return apply_model(input_x, timestep, **c)
+                return _call_next(apply_model, input_x, timestep, c)
             finally:
                 lllite.restore()
                 lllite.clear_cond_image()

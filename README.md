@@ -35,6 +35,7 @@ Place LLLite weights (`.safetensors`) under `ComfyUI/models/controlnet/`.
 | `strength` | FLOAT | LLLite multiplier (default 1.0) |
 | `start_percent` | FLOAT | start of the active sampling window (0.0 = sigma_max) |
 | `end_percent` | FLOAT | end of the active sampling window (1.0 = sigma_min) |
+| `preserve_wrapper` | BOOLEAN | if a previous node already installed a `model_function_wrapper`, delegate to it from inside this node's wrapper so they cascade instead of overwriting (default `True`) |
 | `mask` *(optional)* | MASK | required when the weights are 4-channel (inpaint); white = inpaint area, black = keep |
 
 Output: patched `MODEL`.
@@ -66,6 +67,34 @@ from the weights metadata and applied automatically.
 connected to a 3-channel LLLite the node logs a warning and ignores it.
 A 4-channel weight without a mask raises a `ValueError` rather than
 silently substituting an empty mask.
+
+### Cascading multiple LLLite nodes
+
+Multiple **Apply Anima ControlNet-LLLite** nodes can be chained on the same
+`MODEL` to apply more than one LLLite at the same time (e.g. a pose LLLite
+and a depth LLLite, or several inpaint LLLites with different conditions).
+Just feed the output `MODEL` of one node into the `model` input of the next.
+
+ComfyUI's `model_options` has a single `model_function_wrapper` slot, so two
+nodes that each install a wrapper would normally cause the outer one to
+silently overwrite the inner one. To avoid this, each node captures the
+previously-installed wrapper before cloning and delegates to it from inside
+its own wrapper, so wrappers stack instead of replacing each other. This is
+controlled by the `preserve_wrapper` toggle (default `True`); turn it off to
+get the legacy single-wrapper behavior, or to deliberately replace an
+upstream wrapper.
+
+Notes when cascading:
+
+* Each node has its own `start_percent` / `end_percent` window — when a
+  node's window is inactive it is a pass-through to the next wrapper, so
+  you can stage different LLLites across different parts of the schedule.
+* `strength` is per-node and they add independently in the LLLite output;
+  there is no global normalization, so very high combined strengths can
+  over-saturate the same way a single high `strength` would.
+* The pattern is compatible with other well-behaved wrapper-installing
+  nodes (e.g. `ChromaRadianceOptions`) provided they follow the same
+  delegate-to-previous-wrapper convention.
 
 ## How it works
 
