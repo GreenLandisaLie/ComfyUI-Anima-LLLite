@@ -104,8 +104,7 @@ def _prepare_mask(mask: torch.Tensor, latent_h: int, latent_w: int,
     return m.to(device=device)
 
 
-def _build_inpaint_cond_image(rgb_pm1: torch.Tensor, mask01: torch.Tensor,
-                              masked_input: bool) -> torch.Tensor:
+def _build_inpaint_cond_image(rgb_pm1: torch.Tensor, mask01: torch.Tensor, masked_input: bool, inpaint_str: float = 0.0) -> torch.Tensor:
     """rgb_pm1: (1,3,H,W) in [-1,1], mask01: (1,1,H,W) in {0,1}. Returns (1,4,H,W).
 
     Mirrors ``_build_inpaint_cond_image`` in the sd-scripts training / inference
@@ -113,13 +112,17 @@ def _build_inpaint_cond_image(rgb_pm1: torch.Tensor, mask01: torch.Tensor,
     and if ``masked_input`` is set the RGB is zeroed where ``mask >= 0.5``.
     """
     if masked_input:
-        keep = (mask01 < 0.5).to(rgb_pm1.dtype)
+        keep = torch.where(
+            mask01 < 0.5,
+            torch.ones_like(mask01, dtype=rgb_pm1.dtype),               # outside mask → 100%
+            torch.full_like(mask01, inpaint_str, dtype=rgb_pm1.dtype)   # inside mask → X%
+        )
         rgb_pm1 = rgb_pm1 * keep
     mask_pm1 = mask01.to(rgb_pm1.dtype) * 2.0 - 1.0
     return torch.cat([rgb_pm1, mask_pm1], dim=1)
 
 
-class AnimaLLLiteApply:
+class AnimaLLLiteApplyInpaint:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -127,15 +130,12 @@ class AnimaLLLiteApply:
                 "model": ("MODEL",),
                 "lllite_name": (folder_paths.get_filename_list("controlnet"),),
                 "image": ("IMAGE",),
+                "mask": ("MASK",),
+                "white_mask_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "strength": ("FLOAT", {"default": 1.0, "min": -10.0, "max": 10.0, "step": 0.01}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
                 "preserve_wrapper": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                # Required when the loaded weights are 4ch (inpaint). White = inpaint area,
-                # black = keep. Mismatch with the weights' cond_in_channels is reported below.
-                "mask": ("MASK",),
             },
         }
 
@@ -143,12 +143,17 @@ class AnimaLLLiteApply:
     FUNCTION = "apply"
     CATEGORY = "loaders"
 
-    def apply(self, model, lllite_name, image, strength, start_percent, end_percent,
-              preserve_wrapper=True, mask=None):
+    def apply(self, model, lllite_name, image, mask, white_mask_strength, strength, start_percent, end_percent,
+              preserve_wrapper=True):
         weights_path = folder_paths.get_full_path("controlnet", lllite_name)
         if weights_path is None or not os.path.isfile(weights_path):
             raise FileNotFoundError(f"LLLite weights not found: {lllite_name}")
-
+        
+        
+        if mask is None:
+            raise ValueError("AnimaLLLiteApplyInpaint: 'mask' is required but was not provided.")
+        
+        
         # Architecture is fully determined by the trained weights — read everything
         # from metadata rather than exposing knobs that would just cause load errors.
         meta = read_lllite_metadata(weights_path)
@@ -209,6 +214,8 @@ class AnimaLLLiteApply:
         src_image = image.detach().clone()
         src_mask = mask.detach().clone() if mask is not None else None
         is_inpaint = cond_in_channels == 4
+        
+        inpaint_str = white_mask_strength
 
         # Cache for the per-resolution preprocessed cond image (avoids repeat resize)
         cache = {"cond_image_pp": None, "key": None, "lllite_loaded_to": None}
@@ -258,7 +265,7 @@ class AnimaLLLiteApply:
                         src_mask, latent_h, latent_w, device, dtype, patch_spatial
                     )
                     cache["cond_image_pp"] = _build_inpaint_cond_image(
-                        rgb, mk, inpaint_masked_input
+                        rgb, mk, inpaint_masked_input, inpaint_str
                     )
                 else:
                     cache["cond_image_pp"] = rgb
@@ -279,9 +286,9 @@ class AnimaLLLiteApply:
 
 
 NODE_CLASS_MAPPINGS = {
-    "AnimaLLLiteApply": AnimaLLLiteApply,
+    "AnimaLLLiteApplyInpaint": AnimaLLLiteApplyInpaint,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "AnimaLLLiteApply": "Apply Anima ControlNet-LLLite",
+    "AnimaLLLiteApplyInpaint": "Apply Anima ControlNet-LLLite with White Mask Str modifier",
 }
