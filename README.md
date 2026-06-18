@@ -18,7 +18,7 @@ Clone into `ComfyUI/custom_nodes/`:
 
 ```
 cd ComfyUI/custom_nodes
-git clone <this-repo> ComfyUI-Anima-LLLite
+git clone https://github.com/GreenLandisaLie/ComfyUI-Anima-LLLite-Inpaint
 ```
 
 Place LLLite weights (`.safetensors`) under `ComfyUI/models/controlnet/`.
